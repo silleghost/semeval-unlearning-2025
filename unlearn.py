@@ -238,8 +238,8 @@ def unlearn(
     model.print_trainable_parameters()
 
     # Create dataloaders
-    forget_dataset = UnlearningDataset(path_to_forget_set + "forget.parquet", tokenizer)
-    retain_dataset = UnlearningDataset(path_to_retain_set + "retain.parquet", tokenizer)
+    forget_dataset = UnlearningDataset(path_to_forget_set, tokenizer)
+    retain_dataset = UnlearningDataset(path_to_retain_set, tokenizer)
 
     forget_dataloader = DataLoader(forget_dataset, batch_size=batch_size, shuffle=True)
     retain_dataloader = DataLoader(retain_dataset, batch_size=batch_size, shuffle=True)
