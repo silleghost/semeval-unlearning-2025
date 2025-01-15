@@ -4,18 +4,12 @@ def unlearn(
     path_to_forget_set: str,
     path_to_retain_set: str,
     tokenizer_path: str,
-    num_epochs: int = 4,
-    learning_rate: float = 2e-5,
-    batch_size: int = 16,
-    lora_rank: int = 32,
-    damping_factor: float = 1e-3,
-    sophia_rho: float = 0.06,
-    sophia_gamma: float = 1.2,
-    accumulation_steps: int = 4,
 ):
     """
-    Unlearning implementation using LoRA and Sophia optimizer.
+    Memory-optimized unlearning implementation using LoRA and Sophia optimizer.
+    Balanced for all types of content while maintaining reasonable GPU memory usage.
     """
+    import gc
     import os
     import shutil
     from typing import Tuple
@@ -29,29 +23,27 @@ def unlearn(
     from tqdm import tqdm
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    # Sophia optimizer implementation
+    NUM_EPOCHS = 4
+    LEARNING_RATE = 2e-5
+    BATCH_SIZE = 4  
+    LORA_RANK = 16 
+    ACCUMULATION_STEPS = 8 
+    MAX_LENGTH = 1024 
+    DAMPING_FACTOR = 1e-3
+    SOPHIA_RHO = 0.06
+    SOPHIA_GAMMA = 1.2
+
     class Sophia(Optimizer):
         def __init__(
             self,
             params,
-            lr: float = 1e-4,
-            betas: Tuple[float, float] = (0.9, 0.999),
-            rho: float = 0.04,
-            gamma: float = 1.0,
-            epsilon: float = 1e-8,
-            clipping_threshold: float = 1.0,
+            lr=LEARNING_RATE,
+            betas=(0.9, 0.999),
+            rho=SOPHIA_RHO,
+            gamma=SOPHIA_GAMMA,
+            epsilon=1e-8,
+            clipping_threshold=1.0,
         ):
-            if not 0.0 <= lr:
-                raise ValueError(f"Invalid learning rate: {lr}")
-            if not 0.0 <= epsilon:
-                raise ValueError(f"Invalid epsilon value: {epsilon}")
-            if not 0.0 <= betas[0] < 1.0:
-                raise ValueError(f"Invalid beta1 parameter: {betas[0]}")
-            if not 0.0 <= betas[1] < 1.0:
-                raise ValueError(f"Invalid beta2 parameter: {betas[1]}")
-            if not 0.0 <= rho <= 1.0:
-                raise ValueError(f"Invalid rho value: {rho}")
-
             defaults = dict(
                 lr=lr,
                 betas=betas,
@@ -79,12 +71,41 @@ def unlearn(
 
                     if len(state) == 0:
                         state["step"] = 0
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["hessian"] = torch.zeros_like(p)
+
+                    exp_avg = state["exp_avg"]
+                    hessian = state["hessian"]
+                    beta1, beta2 = group["betas"]
+                    state["step"] += 1
+
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+
+                    if torch.rand(1) < group["rho"]:
+                        with torch.enable_grad():
+                            grad_squared = grad * grad
+                        hessian.mul_(beta2).add_(grad_squared, alpha=1 - beta2)
+
+                    bias_correction1 = 1 - beta1 ** state["step"]
+                    bias_correction2 = 1 - beta2 ** state["step"]
+
+                    denominator = torch.maximum(
+                        group["gamma"] * hessian / bias_correction2,
+                        torch.full_like(hessian, group["epsilon"]),
+                    )
+
+                    update = exp_avg / bias_correction1 / denominator
+                    update.clamp_(
+                        -group["clipping_threshold"], group["clipping_threshold"]
+                    )
+                    p.add_(update, alpha=-group["lr"])
+
+            return loss
 
     class UnlearningDataset(Dataset):
-        def __init__(self, file_path: str, tokenizer, max_length: int = 2048):
+        def __init__(self, file_path: str, tokenizer):
             self.df = pd.read_parquet(file_path)
             self.tokenizer = tokenizer
-            self.max_length = max_length
 
         def __len__(self):
             return len(self.df)
@@ -97,7 +118,7 @@ def unlearn(
                 full_text,
                 truncation=True,
                 padding="max_length",
-                max_length=self.max_length,
+                max_length=MAX_LENGTH,
                 return_tensors="pt",
             )
 
@@ -107,63 +128,13 @@ def unlearn(
                 "labels": encodings["input_ids"].squeeze(),
             }
 
-    def compute_adaptive_damping(
-        model, dataloader, device, initial_damping=1e-3, min_damping=1e-5
-    ):
-        """Compute adaptive damping factor based on gradient statistics."""
-        grad_norms = []
-        model.train()
-
-        for batch in dataloader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                labels=batch["labels"],
-            )
-            loss = outputs.loss
-            loss.backward()
-
-            total_norm = 0
-            for p in model.parameters():
-                if p.grad is not None:
-                    total_norm += p.grad.data.norm(2).item() ** 2
-            grad_norms.append(total_norm**0.5)
-
-            model.zero_grad()
-
-        mean_norm = sum(grad_norms) / len(grad_norms)
-        return max(min_damping, initial_damping * (mean_norm**0.5))
-
     def compute_woodfisher(
-        model: nn.Module, dataloader: DataLoader, device: str, damping: float
+        model: nn.Module, dataloader: DataLoader, device: str
     ) -> dict:
         fisher_dict = {}
-        importance_weights = {}
         model.train()
 
-        # Compute importance weights
-        print("Computing importance weights...")
-        for batch in tqdm(dataloader):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.no_grad():
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                )
-                loss = outputs.loss
-                weight = torch.sigmoid(loss - loss.mean())
-
-                for name, param in model.named_parameters():
-                    if param.requires_grad:
-                        if name not in importance_weights:
-                            importance_weights[name] = []
-                        importance_weights[name].append(weight)
-
-        # Compute weighted Fisher
-        print("Computing WoodFisher approximation...")
-        for batch in tqdm(dataloader):
+        for batch in tqdm(dataloader, desc="Computing WoodFisher"):
             batch = {k: v.to(device) for k, v in batch.items()}
             outputs = model(
                 input_ids=batch["input_ids"],
@@ -178,15 +149,15 @@ def unlearn(
                     if name not in fisher_dict:
                         fisher_dict[name] = []
                     grad = param.grad.detach()
-                    weight = importance_weights[name].pop(0)
-                    fisher_dict[name].append(grad.pow(2) * weight)
+                    fisher_dict[name].append(grad.pow(2))
 
             model.zero_grad()
+            torch.cuda.empty_cache() 
 
         # Average and compute inverse with dampening
         for name in fisher_dict:
             fisher_dict[name] = torch.stack(fisher_dict[name]).mean(0)
-            fisher_dict[name] = 1.0 / (fisher_dict[name] + damping)
+            fisher_dict[name] = 1.0 / (fisher_dict[name] + DAMPING_FACTOR)
 
         return fisher_dict
 
@@ -209,57 +180,39 @@ def unlearn(
         torch_dtype=torch.float16,
     )
 
-    # Optimized LoRA configuration
     lora_config = LoraConfig(
-        r=lora_rank,
+        r=LORA_RANK,
         lora_alpha=32,
         target_modules=[
             "q_proj",
             "k_proj",
             "v_proj",
             "o_proj",
-            "gate_proj",
-        ],  # Added gate_proj
+        ], 
         lora_dropout=0.1,
         bias="none",
         task_type="CAUSAL_LM",
     )
 
-    # Create PEFT model
     print("Applying LoRA adaptation...")
     model = get_peft_model(base_model, lora_config)
     model.print_trainable_parameters()
 
-    # Create dataloaders with dynamic batch sizing
+    # Create dataloaders
     forget_dataset = UnlearningDataset(path_to_forget_set, tokenizer)
     retain_dataset = UnlearningDataset(path_to_retain_set, tokenizer)
 
     forget_dataloader = DataLoader(
-        forget_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
+        forget_dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True
     )
     retain_dataloader = DataLoader(
-        retain_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
+        retain_dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True
     )
-
-    # Compute adaptive damping
-    print("Computing adaptive damping factor...")
-    adaptive_damping = compute_adaptive_damping(model, retain_dataloader, device)
 
     # Phase 1: Influence-based Update
-    print("Phase 1: Applying influence-based update...")
-    woodfisher_inv = compute_woodfisher(
-        model, retain_dataloader, device, adaptive_damping
-    )
+    print("Phase 1: Computing WoodFisher approximation...")
+    woodfisher_inv = compute_woodfisher(model, retain_dataloader, device)
 
-    # Compute gradients on forget set
     print("Computing gradients on forget set...")
     forget_gradients = {}
     model.train()
@@ -281,6 +234,7 @@ def unlearn(
                 forget_gradients[name].append(param.grad.detach().clone())
 
         model.zero_grad()
+        torch.cuda.empty_cache()
 
     # Average gradients
     for name in forget_gradients:
@@ -292,42 +246,24 @@ def unlearn(
         for name, param in model.named_parameters():
             if param.requires_grad and name in woodfisher_inv:
                 update = woodfisher_inv[name] * forget_gradients[name]
-                param.data -= learning_rate * update
+                param.data -= LEARNING_RATE * update
+
+    del woodfisher_inv, forget_gradients
+    torch.cuda.empty_cache()
+    gc.collect()
 
     # Phase 2: Fine-tuning with Sophia
     print("Phase 2: Fine-tuning with Sophia optimizer...")
+    optimizer = Sophia(model.parameters())
 
-    # Initialize Sophia optimizer with layer-wise learning rate decay
-    param_groups = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-
-        # Apply higher learning rate to attention layers
-        if any(module in name for module in ["q_proj", "k_proj", "v_proj", "o_proj"]):
-            lr_scale = 1.2
-        else:
-            lr_scale = 1.0
-
-        param_groups.append({"params": [param], "lr": learning_rate * lr_scale})
-
-    optimizer = Sophia(
-        param_groups,
-        rho=sophia_rho,
-        gamma=sophia_gamma,
-        epsilon=1e-8,
-        clipping_threshold=1.0,
-    )
-
-    # Training loop with gradient accumulation
-    best_forget_loss = float("inf")
+    best_loss = float("inf")
     best_checkpoint_path = None
     patience = 3
     patience_counter = 0
 
     try:
-        for epoch in range(num_epochs):
-            print(f"Epoch {epoch + 1}/{num_epochs}")
+        for epoch in range(NUM_EPOCHS):
+            print(f"Epoch {epoch + 1}/{NUM_EPOCHS}")
             model.train()
             epoch_loss = 0.0
             optimizer.zero_grad()
@@ -339,36 +275,35 @@ def unlearn(
                     attention_mask=batch["attention_mask"],
                     labels=batch["labels"],
                 )
-                loss = outputs.loss / accumulation_steps
+                loss = outputs.loss / ACCUMULATION_STEPS
                 loss.backward()
 
-                if (i + 1) % accumulation_steps == 0:
+                if (i + 1) % ACCUMULATION_STEPS == 0:
                     optimizer.step()
                     optimizer.zero_grad()
 
-                epoch_loss += loss.item() * accumulation_steps
+                epoch_loss += loss.item() * ACCUMULATION_STEPS
 
-                # Checkpoint saving logic
+                # Save checkpoint every quarter epoch
                 if (i + 1) % (len(forget_dataloader) // 4) == 0:
                     current_loss = epoch_loss / (i + 1)
-
-                    # Save checkpoint
                     checkpoint_path = os.path.join(
                         checkpoint_dir, f"checkpoint_epoch_{epoch + 1}_iter_{i + 1}.pt"
                     )
                     model.save_pretrained(checkpoint_path)
 
-                    if current_loss < best_forget_loss:
-                        best_forget_loss = current_loss
+                    if current_loss < best_loss:
+                        best_loss = current_loss
                         best_checkpoint_path = checkpoint_path
                         patience_counter = 0
                     else:
                         patience_counter += 1
 
-                    # Early stopping
                     if patience_counter >= patience:
                         print("Early stopping triggered!")
                         raise StopIteration
+
+                torch.cuda.empty_cache()
 
             avg_epoch_loss = epoch_loss / len(forget_dataloader)
             print(f"Epoch {epoch + 1} completed. Average loss: {avg_epoch_loss:.4f}")
@@ -386,8 +321,8 @@ def unlearn(
             tokenizer.save_pretrained(output_path_to_write_unlearned_model)
             print(f"Model saved to {output_path_to_write_unlearned_model}")
 
-        # Cleanup checkpoints
-        print("Cleaning up checkpoints...")
+        # Cleanup
+        print("Cleaning up...")
         for checkpoint in os.listdir(checkpoint_dir):
             checkpoint_path = os.path.join(checkpoint_dir, checkpoint)
             if checkpoint_path != best_checkpoint_path:
